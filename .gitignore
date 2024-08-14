@@ -1,0 +1,3 @@
+/target
+vm/rootfs.ext4
+vm/kernel.img
