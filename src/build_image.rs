@@ -1,15 +1,18 @@
 //! Build a root file image capable of running the compilers for different programming languages for the firecracker VM.
 
 use std::{
-    ffi::OsStr,
+    cell::OnceCell,
+    ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read, Write},
+    ops::DerefMut,
     path::{Path, PathBuf},
     process::Command,
 };
 
 use color_eyre::eyre::{bail, ensure, Context, Result};
 use rand::distributions::{Alphanumeric, DistString};
+use scopeguard::guard;
 use tempfile::TempDir;
 use tracing::{debug, error, info};
 
@@ -21,6 +24,8 @@ pub struct EphemeralContainer {
     container_id: String,
     username: String,
     password: String,
+    uid: u32,
+    gid: u32,
 }
 
 impl EphemeralContainer {
@@ -38,6 +43,8 @@ impl EphemeralContainer {
         // Hardcoded at the moment
         const BASE_IMAGE: &str = "alpine:3.20";
         const USERNAME: &str = "alpine";
+        const UID: u32 = 1000;
+        const GID: u32 = 1000;
 
         let output = Command::new(Self::BUILDAH_PATH)
             .arg("from")
@@ -67,6 +74,8 @@ impl EphemeralContainer {
             container_id,
             username: USERNAME.to_owned(),
             password,
+            uid: UID,
+            gid: GID,
         })
     }
 
@@ -106,10 +115,10 @@ impl EphemeralContainer {
         // Setup user account
         debug!("Setting up user account");
         self.run(format!("mkdir -p /home/{0}/", self.username))?;
-        self.run(format!("addgroup -S {0}", self.username))?;
+        self.run(format!("addgroup -g {0} -S {1}", self.gid, self.username))?;
         self.run(format!(
-            "adduser -S {0} -G {0} -h /home/{0} -s /bin/sh",
-            self.username
+            "adduser -u {0} -S {1} -G {1} -h /home/{1} -s /bin/sh",
+            self.uid, self.username
         ))?;
         self.run(format!(
             "echo \"{0}:{1}\" | chpasswd",
@@ -160,8 +169,19 @@ impl EphemeralContainer {
 
     /// Build an image of the given size (in bytes) from the container and put it at the specified path.
     pub fn to_image(self, image_path: impl AsRef<Path>, image_size: u64) -> Result<()> {
-        let mut image = File::create_new(&image_path).context("Could not create image file")?;
-        io::copy(&mut io::repeat(0).take(image_size), &mut image)?;
+        info!("Creating image");
+        let defused = OnceCell::new();
+
+        let image = File::create_new(&image_path).context("Could not create image file")?;
+        let mut image = guard(image, |image| {
+            drop(image);
+            if defused.get().is_none() {
+                debug!("Removing image because creation was not successful");
+                let _ = std::fs::remove_file(&image_path);
+            }
+        });
+
+        io::copy(&mut io::repeat(0).take(image_size), image.deref_mut())?;
         image.flush()?;
 
         let mkfs_output = Command::new("mkfs.ext4")
@@ -176,14 +196,24 @@ impl EphemeralContainer {
             );
         }
 
-        let container_mnt_output = Command::new(Self::BUILDAH_PATH)
+        let temp_dir = TempDir::new()?;
+        let mount_dir =
+            Path::new("/mnt").join(Alphanumeric.sample_string(&mut rand::thread_rng(), 8));
+
+        let mut unshare_arg: OsString = OsString::from(r"cp -r $MNT_PATH/* ");
+        unshare_arg.push(temp_dir.path());
+
+        let cp_output = Command::new(Self::BUILDAH_PATH)
             .arg("unshare")
+            .arg("--mount")
+            .arg(format!("MNT_PATH={}", self.container_id))
             .arg("sh")
             .arg("-c")
-            .arg(format!("buildah mount {}", self.container_id))
+            .arg(unshare_arg)
             .output()?;
-        if !container_mnt_output.status.success() {
-            let stderr = String::from_utf8_lossy(&container_mnt_output.stderr);
+
+        if !cp_output.status.success() {
+            let stderr = String::from_utf8_lossy(&cp_output.stderr);
             bail!(
                 "Could not mount ephemeral container {}: {}",
                 self.container_id,
@@ -191,75 +221,76 @@ impl EphemeralContainer {
             );
         }
 
-        let container_mnt_path = PathBuf::from(
-            String::from_utf8(container_mnt_output.stdout)
-                .context("Could not mount ephemeral containers' rootfs")?
-                .trim()
-                .to_owned(),
-        );
-        ensure!(
-            container_mnt_path.try_exists()?,
-            "Could not mount ephemeral containers' rootfs"
-        );
-        debug!(
-            "Ephemeral containers rootfs mounted at {}",
-            container_mnt_path.display()
-        );
-
-        let image_mnt_dir = TempDir::new()?;
-        // TODO: Use unshare to not require sudo
-        let image_mnt_output = Command::new("sudo")
-            .arg("mount")
-            .arg(image_path.as_ref())
-            .arg(image_mnt_dir.path())
-            .output()?;
-        if !image_mnt_output.status.success() {
-            let stderr = String::from_utf8_lossy(&image_mnt_output.stderr);
-            bail!("Could not mount image: {}", stderr.trim());
-        }
-        debug!("Image mounted at {}", image_mnt_dir.path().display());
-
-        let cp_output = Command::new("sudo")
-            .arg("cp")
-            .arg("-r")
-            .arg(&container_mnt_path)
-            .arg(image_mnt_dir.path())
-            .output()?;
-
         if !cp_output.status.success() {
             let stderr = String::from_utf8_lossy(&cp_output.stderr);
-            bail!("Could not cp image contents: {}", stderr.trim());
+            bail!("Could not cp container contents: {}", stderr.trim());
+        }
+
+        let mut cp_arg = OsString::from("mkdir ");
+        cp_arg.push(&mount_dir);
+        cp_arg.push(" && mount ");
+        cp_arg.push(image_path.as_ref());
+        cp_arg.push(" ");
+        cp_arg.push(&mount_dir);
+        cp_arg.push(" && cp -r ");
+        cp_arg.push(temp_dir.path());
+        cp_arg.push("/* ");
+        cp_arg.push(&mount_dir);
+        cp_arg.push(" && chown root:root ");
+        cp_arg.push(&mount_dir);
+        cp_arg.push(format!("/* && chown {}:{} ", self.uid, self.gid));
+        cp_arg.push(mount_dir.join(format!("home/{}", self.username)));
+        cp_arg.push(" && umount ");
+        cp_arg.push(&mount_dir);
+
+        debug!("Running sudo command: {}", cp_arg.to_string_lossy());
+
+        let cp_to_image_output = Command::new("sudo")
+            .arg("sh")
+            .arg("-c")
+            .arg(cp_arg)
+            .output()?;
+        if !cp_to_image_output.status.success() {
+            let stderr = String::from_utf8_lossy(&cp_to_image_output.stderr);
+            bail!(
+                "Could not mount ephemeral container {}: {}",
+                self.container_id,
+                stderr.trim()
+            );
         }
 
         info!(
             "Created image at {} with size {image_size}",
             image_path.as_ref().display()
         );
+
+        defused.get_or_init(|| ());
+
         Ok(())
     }
 }
 
-// impl Drop for EphemeralContainer {
-//     fn drop(&mut self) {
-//         let output = Command::new(Self::BUILDAH_PATH)
-//             .arg("rm")
-//             .arg(&self.container_id)
-//             .output();
-//         match output {
-//             Ok(output) => {
-//                 if !output.status.success() {
-//                     let stderr = String::from_utf8_lossy(&output.stderr);
-//                     error!(
-//                         "Could not delete ephemeral container {}: {}",
-//                         self.container_id,
-//                         stderr.trim()
-//                     );
-//                 }
-//             }
-//             Err(err) => error!(
-//                 "Could not delete ephemeral container {}: {}",
-//                 self.container_id, err
-//             ),
-//         }
-//     }
-// }
+impl Drop for EphemeralContainer {
+    fn drop(&mut self) {
+        let output = Command::new(Self::BUILDAH_PATH)
+            .arg("rm")
+            .arg(&self.container_id)
+            .output();
+        match output {
+            Ok(output) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    error!(
+                        "Could not delete ephemeral container {}: {}",
+                        self.container_id,
+                        stderr.trim()
+                    );
+                }
+            }
+            Err(err) => error!(
+                "Could not delete ephemeral container {}: {}",
+                self.container_id, err
+            ),
+        }
+    }
+}
