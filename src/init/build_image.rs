@@ -4,23 +4,35 @@ use std::{
     cell::OnceCell,
     ffi::{OsStr, OsString},
     fs::File,
-    io::{self, Read, Write},
+    io::{self, BufWriter, Read, Write},
     ops::DerefMut,
     path::{Path, PathBuf},
     process::Command,
+    sync::LazyLock,
 };
 
 use color_eyre::eyre::{bail, ensure, Context, Result};
 use rand::distributions::{Alphanumeric, DistString};
+use reqwest::Url;
 use scopeguard::guard;
 use tempfile::TempDir;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+use crate::util::run_sudo;
+
+const LATEST_KERNEL_IMAGE: &'static str =
+    "spec.ccfc.min/firecracker-ci/v1.9/x86_64/vmlinux-5.10.219-no-acpi";
+static KERNEL_IMAGE_DOWNLOAD_URL: LazyLock<Url> = LazyLock::new(|| {
+    let mut url = Url::parse("https://s3.amazonaws.com/").unwrap();
+    url.set_path(LATEST_KERNEL_IMAGE);
+    url
+});
 
 /// Build up the file image by using `buildah` to build up an alpine container with the necessary tools installed.
 ///
-/// Note that the drop implementation is blocking, so building an image should best not be done from an async context.
+/// Note that the drop implementation is blocking, so building an image should not be done from an async context.
 #[derive(Debug)]
-pub struct EphemeralContainer {
+struct EphemeralContainer {
     container_id: String,
     username: String,
     password: String,
@@ -31,10 +43,10 @@ pub struct EphemeralContainer {
 impl EphemeralContainer {
     const BUILDAH_PATH: &'static str = "buildah";
 
-    pub fn username(&self) -> &str {
+    fn username(&self) -> &str {
         &self.username
     }
-    pub fn password(&self) -> &str {
+    fn password(&self) -> &str {
         &self.password
     }
 
@@ -105,12 +117,21 @@ impl EphemeralContainer {
 
     /// Setup the container by installing necessary packages and tools
     fn setup(&self) -> Result<()> {
+        const PACKAGES: [&'static str; 5] = ["openrc", "sudo", "util-linux", "dropbear", "clang"];
+
         // TODO: Dropbear, https://gruchalski.com/posts/2021-02-13-launching-alpine-linux-on-firecracker-like-a-boss/
 
         // Install necessary packages
         debug!("Installing packages");
         self.run("apk update")?;
-        self.run("apk add openrc sudo util-linux")?;
+        self.run(format!(
+            "apk add{}",
+            PACKAGES.iter().fold(String::new(), |mut acc, s| {
+                acc.push(' ');
+                acc.push_str(s);
+                acc
+            })
+        ))?;
 
         // Setup user account
         debug!("Setting up user account");
@@ -144,7 +165,8 @@ impl EphemeralContainer {
                  && rc-update add devfs boot \
                  && rc-update add procfs boot \
                  && rc-update add sysfs boot \
-                 && rc-update add local default",
+                 && rc-update add local default \
+                 && rc-update add dropbear",
         )
         .context("Could not setup system jobs")?;
 
@@ -160,7 +182,7 @@ impl EphemeralContainer {
     }
 
     /// Build the ephemeral container.
-    pub fn build() -> Result<Self> {
+    fn build() -> Result<Self> {
         info!("Building ephemeral container");
         let this = Self::new()?;
         this.setup()?;
@@ -168,7 +190,7 @@ impl EphemeralContainer {
     }
 
     /// Build an image of the given size (in bytes) from the container and put it at the specified path.
-    pub fn to_image(self, image_path: impl AsRef<Path>, image_size: u64) -> Result<()> {
+    fn to_image(self, image_path: impl AsRef<Path>, image_size: u64) -> Result<()> {
         info!("Creating image");
         let defused = OnceCell::new();
 
@@ -226,6 +248,7 @@ impl EphemeralContainer {
             bail!("Could not cp container contents: {}", stderr.trim());
         }
 
+        // TODO: find a way to do this without `sudo`
         let mut cp_arg = OsString::from("mkdir ");
         cp_arg.push(&mount_dir);
         cp_arg.push(" && mount ");
@@ -245,19 +268,7 @@ impl EphemeralContainer {
 
         debug!("Running sudo command: {}", cp_arg.to_string_lossy());
 
-        let cp_to_image_output = Command::new("sudo")
-            .arg("sh")
-            .arg("-c")
-            .arg(cp_arg)
-            .output()?;
-        if !cp_to_image_output.status.success() {
-            let stderr = String::from_utf8_lossy(&cp_to_image_output.stderr);
-            bail!(
-                "Could not mount ephemeral container {}: {}",
-                self.container_id,
-                stderr.trim()
-            );
-        }
+        run_sudo(cp_arg).context("Could not copy files from container to image")?;
 
         info!(
             "Created image at {} with size {image_size}",
@@ -293,4 +304,46 @@ impl Drop for EphemeralContainer {
             ),
         }
     }
+}
+
+/// Create and download necessary kernel and rootfs images.
+pub fn init_images(
+    kernel_image_path: &Path,
+    rootfs_image_path: &Path,
+    rootfs_size: u64,
+) -> Result<()> {
+    if rootfs_image_path.try_exists()? {
+        warn!(
+            "RootFS image already exists at {}, not building it",
+            rootfs_image_path.display()
+        );
+    } else {
+        let container = EphemeralContainer::build()?;
+
+        println!(
+            "Default user is {}, password is {}",
+            container.username(),
+            container.password()
+        );
+        container.to_image(&rootfs_image_path, rootfs_size)?;
+    }
+
+    if kernel_image_path.try_exists()? {
+        warn!(
+            "Kernel image already exists at {}, not downloading it",
+            kernel_image_path.display()
+        );
+    } else {
+        info!(
+            "Downloading image from {} and putting it into {}",
+            *KERNEL_IMAGE_DOWNLOAD_URL,
+            kernel_image_path.display()
+        );
+        let image_contents = reqwest::blocking::get(KERNEL_IMAGE_DOWNLOAD_URL.clone())
+            .context("Could not download kernel image")?;
+
+        let mut file = BufWriter::new(File::create(kernel_image_path)?);
+        std::io::copy(&mut image_contents.bytes()?.as_ref(), &mut file)?;
+    }
+    Ok(())
 }
