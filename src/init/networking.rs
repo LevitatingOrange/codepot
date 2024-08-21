@@ -1,4 +1,4 @@
-use std::{collections::HashSet, net::Ipv4Addr};
+use std::collections::HashSet;
 
 use color_eyre::{
     eyre::{ensure, Context, OptionExt},
@@ -23,7 +23,7 @@ fn random_if_name() -> String {
 // - MAC addresses and IPs need to be setup
 // - Multiple tuns need to be setup
 
-fn setup_tap_interface(if_name: &str, host_if_name: &str, address: Ipv4Net) -> Result<()> {
+fn setup_tap_interface(if_name: &str) -> Result<()> {
     // Remove interface...
     run_sudo(format!("ip link del {if_name} 2> /dev/null || true"))?;
 
@@ -112,8 +112,7 @@ pub fn init_networking(
     setup_host_interface(host_if_name, host_address).context("could not setup host interface")?;
     for if_conf in &ifs {
         debug!("Setting up tap interface {}", if_conf.if_name);
-        setup_tap_interface(&if_conf.if_name, host_if_name, if_conf.ip_address)
-            .context("could not setup tap interface")?;
+        setup_tap_interface(&if_conf.if_name).context("could not setup tap interface")?;
     }
 
     Ok((ifs, host_address))

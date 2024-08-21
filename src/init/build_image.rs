@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{self, BufWriter, Read, Write},
     ops::DerefMut,
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
     sync::LazyLock,
 };
@@ -15,7 +15,7 @@ use color_eyre::eyre::{bail, ensure, Context, Result};
 use rand::distributions::{Alphanumeric, DistString};
 use reqwest::Url;
 use scopeguard::guard;
-use tempfile::{tempfile, NamedTempFile, TempDir};
+use tempfile::{NamedTempFile, TempDir};
 use tracing::{debug, error, info, warn};
 
 use crate::util::run_sudo;

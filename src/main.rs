@@ -11,7 +11,6 @@ use init::{init_images, init_networking};
 use ipnet::Ipv4Net;
 use machine::config::MachineConfigurator;
 use rand::distributions::{Alphanumeric, DistString};
-use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 mod config;

@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufWriter, Write},
+    io::Write,
     net::Ipv4Addr,
     path::{Path, PathBuf},
 };
