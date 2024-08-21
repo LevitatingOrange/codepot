@@ -15,7 +15,7 @@ use color_eyre::eyre::{bail, ensure, Context, Result};
 use rand::distributions::{Alphanumeric, DistString};
 use reqwest::Url;
 use scopeguard::guard;
-use tempfile::TempDir;
+use tempfile::{tempfile, NamedTempFile, TempDir};
 use tracing::{debug, error, info, warn};
 
 use crate::util::run_sudo;
@@ -27,6 +27,11 @@ static KERNEL_IMAGE_DOWNLOAD_URL: LazyLock<Url> = LazyLock::new(|| {
     url.set_path(LATEST_KERNEL_IMAGE);
     url
 });
+
+const GET_CMDLINE_KEY_SCRIPT: &'static str = include_str!("../../vm_utils/get_cmdline_key");
+const IFUPDOWN_EXECUTOR_SCRIPT: &'static str = include_str!("../../vm_utils/cmdline_static");
+const INTERFACES_CONFIG: &'static str = include_str!("../../vm_utils/interfaces");
+const MOTD: &'static str = include_str!("../../vm_utils/motd");
 
 /// Build up the file image by using `buildah` to build up an alpine container with the necessary tools installed.
 ///
@@ -42,6 +47,9 @@ struct EphemeralContainer {
 
 impl EphemeralContainer {
     const BUILDAH_PATH: &'static str = "buildah";
+    const RUSTUP_VERSION: &'static str = "1.27.1";
+    const RUSTUP_SHA256: &'static str =
+        "1455d1df3825c5f24ba06d9dd1c7052908272a2cae9aa749ea49d67acbe22b47";
 
     fn username(&self) -> &str {
         &self.username
@@ -51,10 +59,9 @@ impl EphemeralContainer {
     }
 
     /// Start building the container
-    fn new() -> Result<Self> {
+    fn new(username: String, password: String) -> Result<Self> {
         // Hardcoded at the moment
         const BASE_IMAGE: &str = "alpine:3.20";
-        const USERNAME: &str = "alpine";
         const UID: u32 = 1000;
         const GID: u32 = 1000;
 
@@ -78,13 +85,11 @@ impl EphemeralContainer {
             "Could not create ephemeral container: Invalid output from buildah: {container_id}"
         );
 
-        let password = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
-
         debug!("Created ephemeral container with id {container_id}");
 
         Ok(Self {
             container_id,
-            username: USERNAME.to_owned(),
+            username,
             password,
             uid: UID,
             gid: GID,
@@ -113,6 +118,54 @@ impl EphemeralContainer {
         }
 
         Ok(())
+    }
+
+    /// Copy a file into the container.
+    fn copy(&self, from_host: impl AsRef<Path>, to_container: impl AsRef<Path>) -> Result<()> {
+        let output = Command::new(Self::BUILDAH_PATH)
+            .arg("copy")
+            .arg(&self.container_id)
+            .arg(from_host.as_ref())
+            .arg(to_container.as_ref())
+            .output()
+            .with_context(|| {
+                format!(
+                    "Could not copy from host \"{}\" to \"{}\" in container",
+                    from_host.as_ref().display(),
+                    to_container.as_ref().display()
+                )
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Could not create ephemeral container: {}", stderr.trim());
+        }
+
+        Ok(())
+    }
+
+    fn add_file_contents(
+        &self,
+        path: impl AsRef<Path>,
+        contents: &str,
+        permissions: &str,
+    ) -> Result<()> {
+        let mut temp = NamedTempFile::new()?;
+        temp.write_all(&contents.as_bytes())?;
+        temp.flush()?;
+        self.copy(temp.path(), &path)
+            .context("Could not add file contents")?;
+
+        let mut arg = OsString::new();
+        arg.push("chmod ");
+        arg.push(permissions);
+        arg.push(" ");
+        arg.push(path.as_ref());
+        self.run(arg).context("Could not set mode for file")?;
+        Ok(())
+    }
+
+    fn install_rust(&self) {
+        todo!();
     }
 
     /// Setup the container by installing necessary packages and tools
@@ -178,13 +231,32 @@ impl EphemeralContainer {
         )
         .context("Could not setup RC")?;
 
+        debug!("Copying files...");
+        self.add_file_contents(
+            "/usr/local/bin/get_cmdline_key",
+            GET_CMDLINE_KEY_SCRIPT,
+            "755",
+        )
+        .context("Could not add cmdline get script")?;
+        self.add_file_contents(
+            "/usr/libexec/ifupdown-ng/cmdline_static",
+            IFUPDOWN_EXECUTOR_SCRIPT,
+            "755",
+        )
+        .context("Could not add ifupdown executor script")?;
+        self.add_file_contents("/etc/network/interfaces", INTERFACES_CONFIG, "644")
+            .context("Could not add interfaces config")?;
+        self.add_file_contents("/etc/motd", MOTD, "644")
+            .context("Could not add motd")?;
+        self.run("echo 'DROPBEAR_OPTS=\"-w -j\"' > /etc/conf.d/dropbear")?; // '-s' to disable password logins
+
         Ok(())
     }
 
     /// Build the ephemeral container.
-    fn build() -> Result<Self> {
+    fn build(username: String, password: String) -> Result<Self> {
         info!("Building ephemeral container");
-        let this = Self::new()?;
+        let this = Self::new(username, password)?;
         this.setup()?;
         Ok(this)
     }
@@ -261,7 +333,9 @@ impl EphemeralContainer {
         cp_arg.push(&mount_dir);
         cp_arg.push(" && chown root:root ");
         cp_arg.push(&mount_dir);
-        cp_arg.push(format!("/* && chown {}:{} ", self.uid, self.gid));
+        cp_arg.push("/* && chmod 4755 ");
+        cp_arg.push(&mount_dir);
+        cp_arg.push(format!("/usr/bin/sudo && chown {}:{} ", self.uid, self.gid));
         cp_arg.push(mount_dir.join(format!("home/{}", self.username)));
         cp_arg.push(" && umount ");
         cp_arg.push(&mount_dir);
@@ -311,6 +385,8 @@ pub fn init_images(
     kernel_image_path: &Path,
     rootfs_image_path: &Path,
     rootfs_size: u64,
+    username: String,
+    password: String,
 ) -> Result<()> {
     if rootfs_image_path.try_exists()? {
         warn!(
@@ -318,7 +394,7 @@ pub fn init_images(
             rootfs_image_path.display()
         );
     } else {
-        let container = EphemeralContainer::build()?;
+        let container = EphemeralContainer::build(username, password)?;
 
         println!(
             "Default user is {}, password is {}",

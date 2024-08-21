@@ -25,9 +25,13 @@ impl InterfaceConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
+    // pub guest_default_username: String,
+    // pub guest_default_password: String,
     pub max_parallel_vm_count: usize,
     pub net: Ipv4Net,
     pub host_ifname: String,
+    /// Address of the bridge on the host
+    pub host_address: Ipv4Net,
     pub interfaces: Vec<InterfaceConfig>,
 }
 
@@ -36,14 +40,22 @@ impl Config {
         max_parallel_vm_count: usize,
         net: Ipv4Net,
         host_ifname: String,
+        host_address: Ipv4Net,
         interfaces: Vec<InterfaceConfig>,
     ) -> Self {
         Self {
             max_parallel_vm_count,
             net,
             host_ifname,
+            host_address,
             interfaces,
         }
+    }
+
+    pub fn read(path: impl AsRef<Path>) -> Result<Self> {
+        let contents = std::fs::read_to_string(path.as_ref())?;
+        debug!("Read config {contents} from {}", path.as_ref().display());
+        Ok(serde_json::from_str(&contents)?)
     }
 
     pub fn write(&self, path: impl AsRef<Path>) -> Result<()> {

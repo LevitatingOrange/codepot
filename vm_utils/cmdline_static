@@ -1,0 +1,26 @@
+#!/bin/sh
+
+# ifupdown-ng executor that sets up a static iface by taking the address from the cmdline boot parameters
+
+up() {
+        ${MOCK} ip addr add "$(/usr/local/bin/get_cmdline_key static_ip)" dev "${IFACE}"
+        ${MOCK} ip route add default via "$(/usr/local/bin/get_cmdline_key gateway_ip)" dev "${IFACE}"
+        ${MOCK} echo -e 'nameserver 8.8.8.8\nnameserver 8.8.4.4' > /etc/resolv.conf
+}
+
+flush() {
+	cmd="addr"
+	arg="dev ${IFACE}"
+
+	${MOCK} ip ${cmd} flush ${arg}
+}
+
+case "$PHASE" in
+up)
+        up
+	;;
+down)
+	flush
+	;;
+*)	exit 0 ;;
+esac

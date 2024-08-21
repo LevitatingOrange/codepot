@@ -23,6 +23,7 @@ impl From<String> for BootArgs {
 impl BootArgs {
     pub const SSH_KEY_KEY: &'static str = "ssh_key";
     pub const STATIC_IP_KEY: &'static str = "static_ip";
+    pub const GATEWAY_IP_KEY: &'static str = "gateway_ip";
 
     pub fn new() -> Self {
         Self::default()
@@ -162,15 +163,17 @@ impl MachineConfigurator {
         rootfs_image_path: impl AsRef<Path>,
         vcpu_count: u8,
         mem_size_mib: usize,
-        host_dev_name: String,
-        guest_mac: String,
+        host_address: Ipv4Addr,
+        host_dev_name: &str,
+        guest_mac: &str,
         ip_address: Ipv4Net,
         pub_ssh_key: &str,
     ) -> Self {
         let mut boot_args = BootArgs::from("console=ttyS0 reboot=k panic=1 pci=off".to_owned());
         boot_args
             .arg(BootArgs::SSH_KEY_KEY, pub_ssh_key)
-            .arg(BootArgs::STATIC_IP_KEY, &ip_address.to_string());
+            .arg(BootArgs::STATIC_IP_KEY, &ip_address.to_string())
+            .arg(BootArgs::GATEWAY_IP_KEY, &host_address.to_string());
 
         Self(VmmConfig {
             block_devices: vec![BlockDeviceConfig {
@@ -196,8 +199,8 @@ impl MachineConfigurator {
             }),
             net_devices: vec![NetworkInterfaceConfig {
                 iface_id: "eth0".to_owned(),
-                host_dev_name,
-                guest_mac: Some(guest_mac),
+                host_dev_name: host_dev_name.to_owned(),
+                guest_mac: Some(guest_mac.to_owned()),
             }],
         })
     }

@@ -10,6 +10,8 @@ use tracing::{debug, info};
 
 use crate::{config::InterfaceConfig, util::run_sudo};
 
+const BRIDGE_NAME: &'static str = "codepot0";
+
 fn random_if_name() -> String {
     format!(
         "vethcdpt{}",
@@ -27,35 +29,37 @@ fn setup_tap_interface(if_name: &str, host_if_name: &str, address: Ipv4Net) -> R
 
     // and create it again to be idempotent.
     run_sudo(format!("ip tuntap add {if_name} mode tap"))?;
-    run_sudo(format!("ip addr add {address} dev {if_name}"))?; // TODO: remove when using bridge
+    run_sudo(format!("ip link set dev {if_name} master {BRIDGE_NAME}"))?;
     run_sudo(format!("ip link set dev {if_name} up"))?;
-
-    // Remove rule...
-    run_sudo(format!(
-        "sudo iptables -D FORWARD -i {if_name} -o {host_if_name} -j ACCEPT || true"
-    ))?;
-
-    // And apply it again to b idempotent.
-    run_sudo(format!(
-        "sudo iptables -I FORWARD 1 -i {if_name} -o {host_if_name} -j ACCEPT || true"
-    ))?;
 
     Ok(())
 }
 
 /// Configure host interface and ip table rules to do NAT.
-fn setup_host_interface(host_if_name: &str) -> Result<()> {
+fn setup_host_interface(host_if_name: &str, host_address: Ipv4Net) -> Result<()> {
+    // Remove bridge
+    run_sudo(format!("ip link del {BRIDGE_NAME} 2> /dev/null || true"))?;
+
+    // Add bridge again to be idempotent.
+    run_sudo(format!("ip link add name {BRIDGE_NAME} type bridge"))?;
+    run_sudo(format!("ip addr add {host_address} dev {BRIDGE_NAME}"))?;
+    run_sudo(format!("ip link set dev {BRIDGE_NAME} up"))?;
+
     // Remove exsting rules...
-    run_sudo(format!(
-        "sudo iptables -t nat -D POSTROUTING -o {host_if_name} -j MASQUERADE || true"
-    ))?;
     run_sudo("iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true")?;
+    run_sudo(format!(
+        "iptables -t nat -D POSTROUTING -o {host_if_name} -j MASQUERADE || true"
+    ))?;
+    run_sudo(format!(
+        "iptables -D FORWARD -i {BRIDGE_NAME} -j ACCEPT || true"
+    ))?;
 
     // and apply them again to be idempotent.
+    run_sudo("iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")?;
     run_sudo(format!(
-        "sudo iptables -t nat -I POSTROUTING -o {host_if_name} -j MASQUERADE"
+        "iptables -t nat -A POSTROUTING -o {host_if_name} -j MASQUERADE"
     ))?;
-    run_sudo("iptables -I FORWARD 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT")?;
+    run_sudo(format!("iptables -A FORWARD -i {BRIDGE_NAME} -j ACCEPT"))?;
 
     Ok(())
 }
@@ -65,7 +69,7 @@ pub fn init_networking(
     max_parallel_vm_count: usize,
     host_if_name: &str,
     net: Ipv4Net,
-) -> Result<Vec<InterfaceConfig>> {
+) -> Result<(Vec<InterfaceConfig>, Ipv4Net)> {
     info!("Setting up networking");
     ensure!(
         max_parallel_vm_count + 1 <= net.hosts().count(),
@@ -73,9 +77,13 @@ pub fn init_networking(
     );
 
     let mut ip_addresses = net.hosts();
-    let host_address = ip_addresses
-        .next()
-        .ok_or_eyre("invalid hostmask specified")?;
+    let host_address = Ipv4Net::new(
+        ip_addresses
+            .next()
+            .ok_or_eyre("invalid hostmask specified")?,
+        net.prefix_len(),
+    )
+    .unwrap();
     let mac_addresses = std::iter::once("06:00:AC:10:00:02".to_owned()); // TODO
 
     if max_parallel_vm_count > 1 {
@@ -101,14 +109,14 @@ pub fn init_networking(
     run_sudo(format!("echo 1 > /proc/sys/net/ipv4/ip_forward"))?;
 
     debug!("Setting up host interface {host_if_name}");
-    setup_host_interface(host_if_name).context("could not setup host interface")?;
+    setup_host_interface(host_if_name, host_address).context("could not setup host interface")?;
     for if_conf in &ifs {
         debug!("Setting up tap interface {}", if_conf.if_name);
         setup_tap_interface(&if_conf.if_name, host_if_name, if_conf.ip_address)
             .context("could not setup tap interface")?;
     }
 
-    Ok(ifs)
+    Ok((ifs, host_address))
 }
 
 pub fn deinit_networking() -> Result<()> {

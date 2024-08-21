@@ -9,6 +9,7 @@ To download and build the necessary images, use `codepot init`. Required utiliti
 - `mkfs.ext4` (`e2fsprogs`)
 
 
-
-
-Idea: put ssh key as boot kernel param and then parse it from /proc/cmdline, put it into authorized keys
+## TODOs
+- [ ] Use initrd for rootfs, have an extra home directory that is an in-memory image. (https://github.com/marcov/firecracker-initrd )
+- [ ] Support for arm (look at the config, boot params, the downloaded kernel, the boot signaler and rust installation)
+- [ ] Install Rust, go and zig into the image

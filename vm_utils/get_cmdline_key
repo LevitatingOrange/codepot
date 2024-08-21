@@ -1,0 +1,13 @@
+#!/bin/sh
+
+if [ -z "$1" ]; then
+    echo "Usage: $0 key"
+    exit 1
+fi
+key=$1
+
+value=$(grep -o -E "\b$key=[^[:space:]]*" /proc/cmdline | sed s/.*=//g)
+if [ -z "$value" ]; then
+    exit 1
+fi
+echo "$value"

@@ -1,0 +1,8 @@
+
+Welcome to Codepot!
+
+This VM is yours to play with. Clang, Go, Rust and Zig are
+installed. You can do anything you want, even install
+packages via apk, but keep in mind that this VM is ephemeral
+and will reset itself after 10 minutes of inactivity.
+
