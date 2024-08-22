@@ -160,9 +160,9 @@ impl MachineConfigurator {
     /// Construct a new configurator from the given config values.
     pub fn new(
         kernel_image_path: impl AsRef<Path>,
-        rootfs_image_path: impl AsRef<Path>,
+        initrd_path: impl AsRef<Path>,
         vcpu_count: u8,
-        mem_size_mib: usize,
+        mem_size_mib: usize, // TODO: compute with size of initrd as it is put into ram
         host_address: Ipv4Addr,
         host_dev_name: &str,
         guest_mac: &str,
@@ -176,19 +176,11 @@ impl MachineConfigurator {
             .arg(BootArgs::GATEWAY_IP_KEY, &host_address.to_string());
 
         Self(VmmConfig {
-            block_devices: vec![BlockDeviceConfig {
-                drive_id: "rootfs".to_owned(),
-                partuuid: None,
-                is_root_device: true,
-                is_read_only: Some(false),
-                path_on_host: Some(rootfs_image_path.as_ref().to_owned()),
-                file_engine_type: Some(FileEngineType::Sync),
-                socket: None,
-            }],
+            block_devices: Vec::new(),
             boot_source: BootSourceConfig {
                 kernel_image_path: kernel_image_path.as_ref().to_owned(),
                 boot_args,
-                initrd_path: None,
+                initrd_path: Some(initrd_path.as_ref().to_owned()),
             },
             cpu_config: None,
             machine_config: Some(MachineConfig {

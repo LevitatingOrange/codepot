@@ -23,7 +23,7 @@ fn default_vm_assets_path() -> PathBuf {
 }
 
 fn default_rootfs_size_mb() -> u64 {
-    800
+    1024
 }
 
 fn default_max_parallel_vm_count() -> usize {
@@ -64,10 +64,6 @@ enum Subcommand {
 /// Initialize by downloading and building necessary images.
 #[argh(subcommand, name = "init")]
 struct Init {
-    /// size of the VM rootfs image, in MB.
-    #[argh(option, default = "default_rootfs_size_mb()")]
-    rootfs_size: u64,
-
     /// maximum number of VMs allowed to coexist at the same time.
     #[argh(option, default = "default_max_parallel_vm_count()")]
     max_parallel_vm_count: usize,
@@ -106,27 +102,19 @@ fn main() -> Result<()> {
         args.vm_assets.display(),
     );
     let kernel_image_path = args.vm_assets.join("kernel.img");
-    let rootfs_image_path = args.vm_assets.join("rootfs.ext4");
+    let initrd_path = args.vm_assets.join("initrd");
     let config_path = args.vm_assets.join("config.json");
 
     match args.subcommand {
         Subcommand::Init(Init {
-            rootfs_size,
             max_parallel_vm_count,
             host_interface,
             net,
             username,
             password,
         }) => {
-            let rootfs_size = rootfs_size * 1024 * 1024;
-            init_images(
-                &kernel_image_path,
-                &rootfs_image_path,
-                rootfs_size,
-                username,
-                password,
-            )
-            .context("Could not initialize images")?;
+            init_images(&kernel_image_path, &initrd_path, username, password)
+                .context("Could not initialize images")?;
 
             if !config_path.try_exists()? {
                 let (interfaces, host_address) =
@@ -146,7 +134,7 @@ fn main() -> Result<()> {
             }
         }
         Subcommand::Run(Run {}) => {
-            for p in &[&kernel_image_path, &rootfs_image_path, &config_path] {
+            for p in &[&kernel_image_path, &initrd_path, &config_path] {
                 ensure!(p.try_exists()?, "Not inited yet, please run `codepot init` to create necessary images and setup networking");
             }
             let config = Config::read(&config_path)
@@ -155,9 +143,9 @@ fn main() -> Result<()> {
             let iface = &config.interfaces[0];
             let configurator = MachineConfigurator::new(
                 kernel_image_path,
-                rootfs_image_path,
+                initrd_path,
                 2,
-                512,
+                1024,
                 config.host_address.addr(),
                 &iface.if_name,
                 &iface.mac_address,

@@ -47,9 +47,13 @@ struct EphemeralContainer {
 
 impl EphemeralContainer {
     const BUILDAH_PATH: &'static str = "buildah";
-    const RUSTUP_VERSION: &'static str = "1.27.1";
+    const RUSTUP_URL: &'static str =
+        "https://static.rust-lang.org/rustup/archive/1.27.1/x86_64-unknown-linux-musl/rustup-init";
     const RUSTUP_SHA256: &'static str =
         "1455d1df3825c5f24ba06d9dd1c7052908272a2cae9aa749ea49d67acbe22b47";
+    const RUST_VERSION: &'static str = "1.80.1";
+    const INITRD_PATH: &'static str = "/initrd";
+    const BUILD_DIR: &'static str = "/build";
 
     fn username(&self) -> &str {
         &self.username
@@ -119,11 +123,69 @@ impl EphemeralContainer {
 
         Ok(())
     }
+    /// Run a single command chrooted.
+    fn chroot_in(&self, cmd: impl AsRef<OsStr>, dir: impl AsRef<Path>) -> Result<()> {
+        let output = Command::new(Self::BUILDAH_PATH)
+            .arg("run")
+            .arg(&self.container_id)
+            .arg("--")
+            .arg("chroot")
+            .arg(&dir.as_ref())
+            .arg("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .with_context(|| {
+                format!(
+                    "Could not run \"{}\" in container",
+                    cmd.as_ref().to_string_lossy()
+                )
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Could not create ephemeral container: {}", stderr.trim());
+        }
+
+        Ok(())
+    }
+
+    /// Run a single command in the working container inside a directory.
+    fn run_in(&self, cmd: impl AsRef<OsStr>, dir: impl AsRef<Path>) -> Result<()> {
+        let output = Command::new(Self::BUILDAH_PATH)
+            .arg("run")
+            .arg("--workingdir")
+            .arg(dir.as_ref())
+            .arg(&self.container_id)
+            .arg("--")
+            .arg("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .with_context(|| {
+                format!(
+                    "Could not run \"{}\" in container",
+                    cmd.as_ref().to_string_lossy()
+                )
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Could not create ephemeral container: {}", stderr.trim());
+        }
+
+        Ok(())
+    }
 
     /// Copy a file into the container.
-    fn copy(&self, from_host: impl AsRef<Path>, to_container: impl AsRef<Path>) -> Result<()> {
+    fn copy(
+        &self,
+        from_host: impl AsRef<Path>,
+        to_container: impl AsRef<Path>,
+        permissions: &str,
+    ) -> Result<()> {
         let output = Command::new(Self::BUILDAH_PATH)
             .arg("copy")
+            .arg("--chmod")
+            .arg(permissions)
             .arg(&self.container_id)
             .arg(from_host.as_ref())
             .arg(to_container.as_ref())
@@ -152,103 +214,162 @@ impl EphemeralContainer {
         let mut temp = NamedTempFile::new()?;
         temp.write_all(&contents.as_bytes())?;
         temp.flush()?;
-        self.copy(temp.path(), &path)
+        debug!(
+            "Adding file in {} with permissions {}",
+            path.as_ref().display(),
+            permissions
+        );
+        self.copy(temp.path(), &path, permissions)
             .context("Could not add file contents")?;
-
-        let mut arg = OsString::new();
-        arg.push("chmod ");
-        arg.push(permissions);
-        arg.push(" ");
-        arg.push(path.as_ref());
-        self.run(arg).context("Could not set mode for file")?;
         Ok(())
     }
 
-    fn install_rust(&self) {
-        todo!();
+    fn add_file_contents_to_build(
+        &self,
+        path: impl AsRef<Path>,
+        contents: &str,
+        permissions: &str,
+    ) -> Result<()> {
+        self.add_file_contents(Path::new(Self::BUILD_DIR).join(path), contents, permissions)
+    }
+
+    fn install_rust(&self) -> Result<()> {
+        debug!("Installing rust");
+        self.run(format!("wget {}", Self::RUSTUP_URL))?;
+        self.run(format!(
+            "echo '{} *rustup-init' | sha256sum -c && chmod +x ./rustup-init",
+            Self::RUSTUP_SHA256
+        ))?;
+        self.run(format!("RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo \
+                              ./rustup-init -y --no-modify-path --profile minimal --default-toolchain {} --default-host x86_64-unknown-linux-musl", Self::RUST_VERSION))?;
+        self.run_in(
+            "cp -r /usr/local/rustup ./usr/local/rustup && \
+                     cp -r /usr/local/cargo ./usr/local/cargo",
+            Self::BUILD_DIR,
+        )?;
+        self.run_in(
+            "echo '$PATH=\"$PATH:/usr/local/cargo/bin\"' >> ./etc/profile",
+            Self::BUILD_DIR,
+        )?;
+
+        Ok(())
     }
 
     /// Setup the container by installing necessary packages and tools
     fn setup(&self) -> Result<()> {
-        const PACKAGES: [&'static str; 5] = ["openrc", "sudo", "util-linux", "dropbear", "clang"];
+        const GUEST_PACKAGES: [&'static str; 7] = [
+            "alpine-base",
+            "openrc",
+            "util-linux",
+            "dropbear",
+            "grep",
+            "doas",
+            "rust",
+        ];
 
-        // TODO: Dropbear, https://gruchalski.com/posts/2021-02-13-launching-alpine-linux-on-firecracker-like-a-boss/
+        debug!("Creating root dir");
+        self.run(format!("mkdir {}", Self::BUILD_DIR))?;
 
         // Install necessary packages
         debug!("Installing packages");
         self.run("apk update")?;
+        // Add package to builder
+        self.run("apk add dropbear ca-certificates gcc")?;
         self.run(format!(
-            "apk add{}",
-            PACKAGES.iter().fold(String::new(), |mut acc, s| {
+            "apk -X http://dl-5.alpinelinux.org/alpine/latest-stable/main -U --allow-untrusted --root {} --initdb add{}",
+            Self::BUILD_DIR,
+            GUEST_PACKAGES.iter().fold(String::new(), |mut acc, s| {
                 acc.push(' ');
                 acc.push_str(s);
                 acc
             })
         ))?;
 
+        self.run_in(
+            "cp /etc/apk/repositories ./etc/apk/repositories",
+            Self::BUILD_DIR,
+        )?;
+
         // Setup user account
         debug!("Setting up user account");
-        self.run(format!("mkdir -p /home/{0}/", self.username))?;
-        self.run(format!("addgroup -g {0} -S {1}", self.gid, self.username))?;
         self.run(format!(
-            "adduser -u {0} -S {1} -G {1} -h /home/{1} -s /bin/sh",
-            self.uid, self.username
-        ))?;
-        self.run(format!(
-            "echo \"{0}:{1}\" | chpasswd",
-            self.username, self.password
-        ))?;
-        self.run(format!(
-            "echo \"%{0} ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/{0}",
+            "mkdir -p {0}/home/{1}/",
+            Self::BUILD_DIR,
             self.username
         ))?;
 
+        self.chroot_in(
+            format!(
+                "addgroup -g {2} -S {0} && \
+                                adduser -u {1} -S {0} -G {0} -G wheel -h /home/{0} -s /bin/sh && \
+                                echo \"{0}:{3}\" | chpasswd",
+                self.username, self.uid, self.gid, self.password
+            ),
+            Self::BUILD_DIR,
+        )?;
+        self.run_in(
+            "echo 'permit nopass :wheel' > ./etc/doas.d/doas.conf",
+            Self::BUILD_DIR,
+        )?;
+
         // Setup auto-login for the serial console
-        debug!("Setting up auto-login");
-        self.run(
-            "ln -s agetty /etc/init.d/agetty.ttyS0 \
-                 && echo ttyS0 > /etc/securetty",
+        debug!("Setting up getty");
+        self.run_in(
+            format!(
+                "ln -s agetty ./etc/init.d/agetty.ttyS0 \
+             && echo ttyS0 > ./etc/securetty \
+             && ln -sf /etc/init.d/agetty.ttyS0 ./etc/runlevels/default/agetty.ttyS0"
+            ),
+            Self::BUILD_DIR,
         )
-        .context("Could not setup auto-login")?;
+        .context("Could not setup getty")?;
 
         // Setup necessary system jobs.
-        debug!("Setting up system jobs");
-        self.run(
-            "rc-update add agetty.ttyS0 default \
-                 && rc-update add devfs boot \
-                 && rc-update add procfs boot \
-                 && rc-update add sysfs boot \
-                 && rc-update add local default \
-                 && rc-update add dropbear",
+        debug!("Setting up VM startup");
+        self.run_in(
+            "ln -sf /etc/init.d/devfs  ./etc/runlevels/boot/devfs && \
+             ln -sf /etc/init.d/procfs     ./etc/runlevels/boot/procfs && \
+             ln -sf /etc/init.d/sysfs      ./etc/runlevels/boot/sysfs && \
+             ln -sf networking             ./etc/init.d/net.eth0 && \
+             ln -sf /etc/init.d/networking ./etc/runlevels/default/networking && \
+             ln -sf /etc/init.d/net.eth0   ./etc/runlevels/default/net.eth0 && \
+             ln -sf dropbearr              ./etc/init.d/dropbear.eth0",
+            Self::BUILD_DIR,
         )
         .context("Could not setup system jobs")?;
 
         // Setup rc
         debug!("Setting up RC");
-        self.run(
-            "mkdir /run/openrc \
-                 && touch /run/openrc/softlevel",
+        self.run_in(
+            "mkdir ./run/openrc \
+             && touch ./run/openrc/softlevel",
+            Self::BUILD_DIR,
         )
         .context("Could not setup RC")?;
 
         debug!("Copying files...");
-        self.add_file_contents(
-            "/usr/local/bin/get_cmdline_key",
+        self.add_file_contents_to_build(
+            "usr/local/bin/get_cmdline_key",
             GET_CMDLINE_KEY_SCRIPT,
             "755",
         )
         .context("Could not add cmdline get script")?;
-        self.add_file_contents(
-            "/usr/libexec/ifupdown-ng/cmdline_static",
+        self.add_file_contents_to_build(
+            "usr/libexec/ifupdown-ng/cmdline_static",
             IFUPDOWN_EXECUTOR_SCRIPT,
             "755",
         )
         .context("Could not add ifupdown executor script")?;
-        self.add_file_contents("/etc/network/interfaces", INTERFACES_CONFIG, "644")
+        self.add_file_contents_to_build("etc/network/interfaces", INTERFACES_CONFIG, "644")
             .context("Could not add interfaces config")?;
-        self.add_file_contents("/etc/motd", MOTD, "644")
+        self.add_file_contents_to_build("etc/motd", MOTD, "644")
             .context("Could not add motd")?;
-        self.run("echo 'DROPBEAR_OPTS=\"-w -j\"' > /etc/conf.d/dropbear")?; // '-s' to disable password logins
+        self.run_in(
+            "echo 'DROPBEAR_OPTS=\"-w -j\"' > ./etc/conf.d/dropbear",
+            Self::BUILD_DIR,
+        )?; // '-s' to disable password logins
+
+        //self.install_rust()?;
 
         Ok(())
     }
@@ -262,40 +383,24 @@ impl EphemeralContainer {
     }
 
     /// Build an image of the given size (in bytes) from the container and put it at the specified path.
-    fn to_image(self, image_path: impl AsRef<Path>, image_size: u64) -> Result<()> {
+    fn build_initrd(self, initrd_path: impl AsRef<Path>) -> Result<()> {
         info!("Creating image");
-        let defused = OnceCell::new();
 
-        let image = File::create_new(&image_path).context("Could not create image file")?;
-        let mut image = guard(image, |image| {
-            drop(image);
-            if defused.get().is_none() {
-                debug!("Removing image because creation was not successful");
-                let _ = std::fs::remove_file(&image_path);
-            }
-        });
+        // TODO: custom init (see https://github.com/marcov/firecracker-initrd/blob/master/container/build-initrd-in-ctr.sh)
+        self.run_in(format!("ln -sf /sbin/init ./init"), Self::BUILD_DIR)?;
+        self.run_in(
+            format!(
+                "find . -print0 | cpio --null --create --verbose --format=newc | tee > {}",
+                Self::INITRD_PATH
+            ),
+            Self::BUILD_DIR,
+        )?;
 
-        io::copy(&mut io::repeat(0).take(image_size), image.deref_mut())?;
-        image.flush()?;
+        info!("Copying initrd to host");
 
-        let mkfs_output = Command::new("mkfs.ext4")
-            .arg(image_path.as_ref())
-            .output()?;
-        if !mkfs_output.status.success() {
-            let stderr = String::from_utf8_lossy(&mkfs_output.stderr);
-            bail!(
-                "Could not delete ephemeral container {}: {}",
-                self.container_id,
-                stderr.trim()
-            );
-        }
-
-        let temp_dir = TempDir::new()?;
-        let mount_dir =
-            Path::new("/mnt").join(Alphanumeric.sample_string(&mut rand::thread_rng(), 8));
-
-        let mut unshare_arg: OsString = OsString::from(r"cp -r $MNT_PATH/* ");
-        unshare_arg.push(temp_dir.path());
+        let mut unshare_arg: OsString =
+            OsString::from(format!("cp -r $MNT_PATH/{} ", Self::INITRD_PATH));
+        unshare_arg.push(&initrd_path.as_ref());
 
         let cp_output = Command::new(Self::BUILDAH_PATH)
             .arg("unshare")
@@ -314,42 +419,6 @@ impl EphemeralContainer {
                 stderr.trim()
             );
         }
-
-        if !cp_output.status.success() {
-            let stderr = String::from_utf8_lossy(&cp_output.stderr);
-            bail!("Could not cp container contents: {}", stderr.trim());
-        }
-
-        // TODO: find a way to do this without `sudo`
-        let mut cp_arg = OsString::from("mkdir ");
-        cp_arg.push(&mount_dir);
-        cp_arg.push(" && mount ");
-        cp_arg.push(image_path.as_ref());
-        cp_arg.push(" ");
-        cp_arg.push(&mount_dir);
-        cp_arg.push(" && cp -r ");
-        cp_arg.push(temp_dir.path());
-        cp_arg.push("/* ");
-        cp_arg.push(&mount_dir);
-        cp_arg.push(" && chown root:root ");
-        cp_arg.push(&mount_dir);
-        cp_arg.push("/* && chmod 4755 ");
-        cp_arg.push(&mount_dir);
-        cp_arg.push(format!("/usr/bin/sudo && chown {}:{} ", self.uid, self.gid));
-        cp_arg.push(mount_dir.join(format!("home/{}", self.username)));
-        cp_arg.push(" && umount ");
-        cp_arg.push(&mount_dir);
-
-        debug!("Running sudo command: {}", cp_arg.to_string_lossy());
-
-        run_sudo(cp_arg).context("Could not copy files from container to image")?;
-
-        info!(
-            "Created image at {} with size {image_size}",
-            image_path.as_ref().display()
-        );
-
-        defused.get_or_init(|| ());
 
         Ok(())
     }
@@ -383,15 +452,14 @@ impl Drop for EphemeralContainer {
 /// Create and download necessary kernel and rootfs images.
 pub fn init_images(
     kernel_image_path: &Path,
-    rootfs_image_path: &Path,
-    rootfs_size: u64,
+    initrd_path: &Path,
     username: String,
     password: String,
 ) -> Result<()> {
-    if rootfs_image_path.try_exists()? {
+    if initrd_path.try_exists()? {
         warn!(
-            "RootFS image already exists at {}, not building it",
-            rootfs_image_path.display()
+            "initrd already exists at {}, not building it",
+            initrd_path.display()
         );
     } else {
         let container = EphemeralContainer::build(username, password)?;
@@ -401,7 +469,7 @@ pub fn init_images(
             container.username(),
             container.password()
         );
-        container.to_image(&rootfs_image_path, rootfs_size)?;
+        container.build_initrd(&initrd_path)?;
     }
 
     if kernel_image_path.try_exists()? {
